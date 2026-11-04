@@ -207,14 +207,12 @@ task printClasspath {
 
 // Enable ZGC: -XX:+UseZGC
 
-// run test when building will slow down the build process
-// manually run when needed
-//test {
-//    useJUnitPlatform()
-//    testLogging {
-//        events "passed", "skipped", "failed"
-//    }
-//}
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+    }
+}
 
 publishMods {
     file = remapJar.archiveFile

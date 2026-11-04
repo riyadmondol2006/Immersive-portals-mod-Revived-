@@ -1,0 +1,130 @@
+# Every push is built, tested end to end and, only if everything passes, released.
+# Pushes to the default branch become the "latest" release; other branches become
+# pre-releases. Add [skip ci] to a commit message to skip all of this.
+name: Test and release
+
+on:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    outputs:
+      mod_version: ${{ steps.version.outputs.mod_version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache smoke test downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/immersive-portals-smoke
+          key: smoke-${{ hashFiles('gradle.properties') }}
+
+      - name: Install virtual display tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            xvfb xauth xdotool ffmpeg libgl1 libgl1-mesa-dri libglx-mesa0 \
+            libxcursor1 libxi6 libxinerama1 libxrandr2 libxxf86vm1
+
+      - name: Work out version
+        id: version
+        run: |
+          base=$(sed -n 's/^mod_version=//p' gradle.properties)
+          minecraft=$(sed -n 's/^minecraft_version=//p' gradle.properties)
+          echo "mod_version=${base}+build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${base}-mc${minecraft}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and run unit tests
+        run: ./gradlew build -Pmod_version=${{ steps.version.outputs.mod_version }} --console=plain
+
+      - name: Server smoke test
+        run: |
+          jar=$(ls build/libs/*-fabric.jar)
+          python3 .github/scripts/smoke_test.py server --jar "$jar" --work "$RUNNER_TEMP/server"
+          python3 .github/scripts/smoke_test.py server --no-mod --work "$RUNNER_TEMP/server-baseline"
+          python3 .github/scripts/smoke_test.py compare --title "Dedicated server" \
+            --with-mod "$RUNNER_TEMP/server/metrics.json" --baseline "$RUNNER_TEMP/server-baseline/metrics.json"
+
+      - name: Client smoke test (portal rendering and crossing)
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          jar=$(ls build/libs/*-fabric.jar)
+          display() { xvfb-run -a -s "-screen 0 854x480x24" "$@"; }
+          display python3 .github/scripts/smoke_test.py client --jar "$jar" --work "$RUNNER_TEMP/client"
+          display python3 .github/scripts/smoke_test.py client --jar "$jar" --with-sodium-iris --work "$RUNNER_TEMP/client-sodium-iris"
+          display python3 .github/scripts/smoke_test.py client --no-mod --work "$RUNNER_TEMP/client-baseline"
+          python3 .github/scripts/smoke_test.py compare --title "Client (software rendering)" \
+            --with-mod "$RUNNER_TEMP/client/metrics.json" --baseline "$RUNNER_TEMP/client-baseline/metrics.json"
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v7
+        with:
+          name: mod-jar
+          path: build/libs/*-fabric.jar
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-test-evidence
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/client*/*.png
+            ${{ runner.temp }}/client*/game/logs/latest.log
+            ${{ runner.temp }}/client*/game/crash-reports/*
+            ${{ runner.temp }}/client*/client.out
+            ${{ runner.temp }}/server*/server.log
+
+  release:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Only this job can write to the repo, and it runs none of the build's code.
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.test.outputs.tag }}
+      IS_DEFAULT_BRANCH: ${{ github.ref_name == github.event.repository.default_branch }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mod-jar
+          path: dist
+
+      - name: Create GitHub release
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists (workflow re-run), nothing to do."
+            exit 0
+          fi
+          cd dist
+          sha256sum ./*.jar > SHA256SUMS.txt
+          channel=(--latest)
+          if [ "$IS_DEFAULT_BRANCH" != "true" ]; then
+            channel=(--prerelease --latest=false)
+          fi
+          gh release create "$TAG" ./*.jar SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes \
+            "${channel[@]}"
